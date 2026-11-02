@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
+using System.Management;
 using System.Windows.Forms;
 using System.Drawing;
 
@@ -12,8 +13,10 @@ namespace MouseSideKeyMapper
     public class HiddenForm : Form
     {
         private const int WM_USER_ACTION = 0x0400;
-        private const int ACTION_X1 = 1;
-        private const int ACTION_X2 = 2;
+        private const int ACTION_X1 = 1;    // 下侧键按下
+        private const int ACTION_X2 = 2;    // 上侧键按下
+        private const int ACTION_X1_UP = 3; // 下侧键松开
+        private const int ACTION_X2_UP = 4; // 上侧键松开
 
         private const int WH_MOUSE_LL = 14;
         private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -24,6 +27,9 @@ namespace MouseSideKeyMapper
         private static Dictionary<string, ushort> NameToVk;
         private string _上侧键;
         private string _下侧键;
+        private ushort _holdVk;    // 当前被按住保持的键（* 后缀），0=无
+        private uint _holdScan;
+        private int _holdSide;     // 属于哪个侧键（1=下侧键, 2=上侧键）
         private string _iniPath;
         private string _currentConfigName;
         private bool _mappingEnabled;
@@ -100,6 +106,8 @@ namespace MouseSideKeyMapper
         public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("user32.dll")]
         private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+        [DllImport("user32.dll")]
+        private static extern bool LockWorkStation();
         #endregion
 
         static HiddenForm()
@@ -246,9 +254,19 @@ namespace MouseSideKeyMapper
                         return (IntPtr)1; // 吞掉事件，抑制侧键原始功能
                     }
                 }
-                if (msg == 0x020C) // WM_XBUTTONUP，一并吞掉防止残留
+                if (msg == 0x020C) // WM_XBUTTONUP
                 {
-                    return (IntPtr)1;
+                    if (btn == 1)
+                    {
+                        PostMessage(this.Handle, WM_USER_ACTION, (IntPtr)ACTION_X1_UP, IntPtr.Zero);
+                        return (IntPtr)1; // 吞掉事件，抑制侧键原始功能
+                    }
+                    if (btn == 2)
+                    {
+                        PostMessage(this.Handle, WM_USER_ACTION, (IntPtr)ACTION_X2_UP, IntPtr.Zero);
+                        return (IntPtr)1; // 吞掉事件，抑制侧键原始功能
+                    }
+                    return (IntPtr)1; // 其他按钮松开，一并吞掉防止残留
                 }
             }
             return CallNextHookEx(_hMouseHook, nCode, wParam, lParam);
@@ -259,64 +277,169 @@ namespace MouseSideKeyMapper
             if (m.Msg == WM_USER_ACTION)
             {
                 int action = (int)m.WParam;
-                if (action == ACTION_X1)
+                switch (action)
                 {
-                    RunAction(_下侧键);
-                }
-                else if (action == ACTION_X2)
-                {
-                    RunAction(_上侧键);
+                    case ACTION_X1: ExecuteCommand(_下侧键, 1); break;
+                    case ACTION_X2: ExecuteCommand(_上侧键, 2); break;
+                    case ACTION_X1_UP: ReleaseHold(1); break;
+                    case ACTION_X2_UP: ReleaseHold(2); break;
                 }
                 return;
             }
             base.WndProc(ref m);
         }
 
-        private void RunAction(string action)
+        // 统一命令分发：INI 键值对可写各种命令（组合键 / 系统动作 / 亮度 / 音量 / 媒体 / 运行 / 打开 / 锁屏等）
+        // side：1=下侧键, 2=上侧键（用于 * 保持键的按下/释放配对）
+        private void ExecuteCommand(string cmd, int side)
         {
-            string cmd = action.Trim().ToUpper();
-            if (cmd == "TASKVIEW")
+            string c = (cmd ?? "").Trim();
+            if (c.Length == 0) return;
+            bool hold = c.EndsWith("*");              // * 后缀 = 按住保持，直到松开侧键才释放
+            string core = hold ? c.Substring(0, c.Length - 1).Trim() : c;
+            if (core.Length == 0) return;
+            string u = core.ToUpperInvariant();
+            switch (u)
             {
-                System.Diagnostics.Process.Start("explorer.exe", "shell:::{3080F90E-D7AD-11D9-BD98-0000947B0257}");
+                case "TASKVIEW":
+                    Process.Start("explorer.exe", "shell:::{3080F90E-D7AD-11D9-BD98-0000947B0257}");
+                    return;
+                case "BRIGHT+": AdjustBrightness(10); return;   // 亮度+
+                case "BRIGHT-": AdjustBrightness(-10); return;  // 亮度-
+                case "VOL+": SendMediaKey(0xAF); return;        // 音量+
+                case "VOL-": SendMediaKey(0xAE); return;        // 音量-
+                case "MUTE": SendMediaKey(0xAD); return;        // 静音
+                case "MEDIA_NEXT": SendMediaKey(0xB0); return;  // 下一曲
+                case "MEDIA_PREV": SendMediaKey(0xB1); return;  // 上一曲
+                case "MEDIA_STOP": SendMediaKey(0xB2); return;  // 停止
+                case "MEDIA_PLAY": case "MEDIA_PAUSE": SendMediaKey(0xB3); return; // 播放/暂停
+                case "LOCK": LockWorkStation(); return;         // 锁屏
+            }
+            if (u.StartsWith("RUN:", StringComparison.Ordinal))   // RUN: "程序" 参数 —— 运行程序(支持参数)
+            {
+                string f, a;
+                SplitPathAndArgs(c.Substring(4), out f, out a);
+                RunOrOpenFile(f, a);
                 return;
             }
-            if (cmd == "WIN+D")
+            if (u.StartsWith("OPEN:", StringComparison.Ordinal))  // OPEN: 文件/网址/文件夹 —— 打开
             {
-                keybd_event(0x5B, 0x5B, 0, UIntPtr.Zero);
-                keybd_event((byte)'D', 0x20, 0, UIntPtr.Zero);
-                Sleep(20);
-                keybd_event((byte)'D', 0x20, 2, UIntPtr.Zero);
-                keybd_event(0x5B, 0x5B, 2, UIntPtr.Zero);
+                RunOrOpenFile(c.Substring(5), "");
                 return;
             }
-            if (cmd == "WIN+E")
+            if (u.StartsWith("SCRIPT:", StringComparison.Ordinal)) // SCRIPT: 脚本路径 [参数] —— 解释器执行
             {
-                keybd_event(0x5B, 0x5B, 0, UIntPtr.Zero);
-                keybd_event((byte)'E', 0x12, 0, UIntPtr.Zero);
-                Sleep(20);
-                keybd_event((byte)'E', 0x12, 2, UIntPtr.Zero);
-                keybd_event(0x5B, 0x5B, 2, UIntPtr.Zero);
+                string f, a;
+                SplitPathAndArgs(c.Substring(7), out f, out a);
+                RunScript(f, a);
                 return;
             }
-            if (cmd == "WIN+R")
+            if (hold)   // * 后缀：单键按住保持
             {
-                keybd_event(0x5B, 0x5B, 0, UIntPtr.Zero);
-                keybd_event((byte)'R', 0x13, 0, UIntPtr.Zero);
-                Sleep(20);
-                keybd_event((byte)'R', 0x13, 2, UIntPtr.Zero);
-                keybd_event(0x5B, 0x5B, 2, UIntPtr.Zero);
+                ushort vk;
+                if (NameToVk.TryGetValue(u, out vk))
+                {
+                    HoldKeyDown(vk, side);
+                }
+                return;   // 组合键带 * 无意义，忽略
+            }
+            SendKeybdCombo(c);   // 默认：按键组合，如 CTRL+C、WIN+D、F6、CTRL+SHIFT+A
+        }
+        // 按住保持：keybd_event down 并记录，等侧键松开时释放
+        private void HoldKeyDown(ushort vk, int side)
+        {
+            uint sc = MapVirtualKey(vk, 0);
+            uint flags = IsExtendedKey(vk) ? KEYEVENTF_EXTENDEDKEY : 0;
+            keybd_event((byte)vk, (byte)sc, flags, UIntPtr.Zero);
+            _holdVk = vk;
+            _holdScan = sc;
+            _holdSide = side;
+        }
+        private void ReleaseHold(int side)
+        {
+            if (_holdSide == side && _holdVk != 0)
+            {
+                uint flags = KEYEVENTF_KEYUP | (IsExtendedKey(_holdVk) ? KEYEVENTF_EXTENDEDKEY : 0);
+                keybd_event((byte)_holdVk, (byte)_holdScan, flags, UIntPtr.Zero);
+                _holdVk = 0;
+                _holdScan = 0;
+                _holdSide = 0;
+            }
+        }
+        // 强制释放当前保持键（退出 / 关闭映射时调用，防止按键卡住）
+        private void ForceReleaseHold()
+        {
+            if (_holdVk != 0)
+            {
+                uint flags = KEYEVENTF_KEYUP | (IsExtendedKey(_holdVk) ? KEYEVENTF_EXTENDEDKEY : 0);
+                keybd_event((byte)_holdVk, (byte)_holdScan, flags, UIntPtr.Zero);
+                _holdVk = 0;
+                _holdScan = 0;
+                _holdSide = 0;
+            }
+        }
+        private static void SendMediaKey(ushort vk)
+        {
+            uint sc = MapVirtualKey(vk, 0);
+            keybd_event((byte)vk, (byte)sc, 0, UIntPtr.Zero);
+            Sleep(30);
+            keybd_event((byte)vk, (byte)sc, 2, UIntPtr.Zero);
+        }
+        // 解析 "带引号路径" 或 路径 + 参数（支持含空格的路径用双引号包裹）
+        private static void SplitPathAndArgs(string line, out string file, out string args)
+        {
+            line = (line ?? "").Trim();
+            args = "";
+            if (line.Length == 0) { file = ""; return; }
+            if (line[0] == '"')
+            {
+                int close = line.IndexOf('"', 1);
+                if (close > 0)
+                {
+                    file = line.Substring(1, close - 1);
+                    args = line.Substring(close + 1).Trim();
+                    return;
+                }
+                file = line.Trim('"');
                 return;
             }
-            if (cmd == "WIN+L")
+            int sp = line.IndexOf(' ');
+            if (sp < 0) { file = line; return; }
+            file = line.Substring(0, sp);
+            args = line.Substring(sp + 1).Trim();
+        }
+        // 运行程序/按关联打开文件，支持参数（UseShellExecute = 按关联执行）
+        private static void RunOrOpenFile(string file, string args)
+        {
+            try
             {
-                keybd_event(0x5B, 0x5B, 0, UIntPtr.Zero);
-                keybd_event((byte)'L', 0x26, 0, UIntPtr.Zero);
-                Sleep(20);
-                keybd_event((byte)'L', 0x26, 2, UIntPtr.Zero);
-                keybd_event(0x5B, 0x5B, 2, UIntPtr.Zero);
-                return;
+                file = (file ?? "").Trim();
+                if (file.Length == 0) return;
+                Process.Start(new ProcessStartInfo(file) { Arguments = args, UseShellExecute = true });
             }
-            SendKeybdCombo(action);
+            catch { }
+        }
+        // 脚本执行：按扩展名选解释器；.ps1 强制用 PowerShell 执行，其余走系统关联
+        private static void RunScript(string file, string args)
+        {
+            try
+            {
+                file = (file ?? "").Trim();
+                if (file.Length == 0) return;
+                string ext = Path.GetExtension(file).ToLowerInvariant();
+                if (ext == ".ps1")
+                {
+                    string ps = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
+                    if (!File.Exists(ps)) ps = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+                    string psArgs = "-NoProfile -ExecutionPolicy Bypass -File \"" + file + "\"";
+                    if (args.Length > 0) psArgs += " " + args;
+                    Process.Start(new ProcessStartInfo(ps) { Arguments = psArgs, UseShellExecute = false });
+                    return;
+                }
+                // 其余：.bat/.cmd/.vbs/.py/.exe 等按系统关联执行并传参
+                RunOrOpenFile(file, args);
+            }
+            catch { }
         }
 
         #region INI（UTF-8 文件解析，兼容中文键名）
@@ -442,6 +565,7 @@ namespace MouseSideKeyMapper
             if (e.Button == MouseButtons.Left)
             {
                 _mappingEnabled = !_mappingEnabled;   // 左键单击切换映射开关
+                if (!_mappingEnabled) ForceReleaseHold();   // 关闭映射时强制释放保持键
                 UpdateTrayTip();
             }
         }
@@ -529,6 +653,7 @@ namespace MouseSideKeyMapper
         {
             if (_cleanedUp) return;   // 幂等，重复调用安全
             _cleanedUp = true;
+            ForceReleaseHold();   // 退出前强制释放保持键，防止按键卡住
 
             // 1. 先卸低级鼠标钩子，杜绝回调残留
             if (_hMouseHook != IntPtr.Zero)
@@ -724,7 +849,7 @@ namespace MouseSideKeyMapper
         {
             try
             {
-                if (!IsAutoStart()) return;   // 任务不存在（用户未开启开机启动），不动
+                if (!IsAutoStart()) return;   // 任务不存在（未设置开启开机启动），不动
                 string cur = Application.ExecutablePath;
                 string taskPath = GetTaskRunPathCom();
                 if (taskPath != null &&
@@ -756,6 +881,9 @@ namespace MouseSideKeyMapper
         #region 组合键发送（支持三键，统一keybd_event + 正确扫描码/扩展键）
         private static void SendKeybdCombo(string comboText)
         {
+            string uc = comboText.Trim().ToUpper();
+            if (uc == "BRIGHT+" || uc == "亮度+") { AdjustBrightness(10); return; }
+            if (uc == "BRIGHT-" || uc == "亮度-") { AdjustBrightness(-10); return; }
             string[] parts = comboText.Split(new char[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
             List<ushort> vks = new List<ushort>();
             foreach (string p in parts)
@@ -794,6 +922,40 @@ namespace MouseSideKeyMapper
                 default:
                     return false;
             }
+        }
+        // 系统亮度调节（WMI 直接调，不依赖 Fn/合成键——系统功能键固件处理，keybd_event 无法触发）
+        private static void AdjustBrightness(int delta)
+        {
+            try
+            {
+                int cur = -1;
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    new ManagementScope(@"\\.\root\WMI"),
+                    new ObjectQuery("SELECT CurrentBrightness FROM WmiMonitorBrightness")))
+                {
+                    foreach (ManagementObject o in searcher.Get())
+                    {
+                        cur = Convert.ToInt32(o["CurrentBrightness"]);
+                        break;
+                    }
+                }
+                if (cur < 0) return;
+                int next = Math.Max(0, Math.Min(100, cur + delta));
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    new ManagementScope(@"\\.\root\WMI"),
+                    new ObjectQuery("SELECT * FROM WmiMonitorBrightnessMethods")))
+                {
+                    foreach (ManagementObject o in searcher.Get())
+                    {
+                        ManagementBaseObject p = o.GetMethodParameters("WmiSetBrightness");
+                        p["Timeout"] = (byte)0;
+                        p["Brightness"] = (byte)next;
+                        o.InvokeMethod("WmiSetBrightness", p, null);
+                        break;
+                    }
+                }
+            }
+            catch { }
         }
         #endregion
 

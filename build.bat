@@ -20,7 +20,7 @@ if not exist "%ICO%" (
 )
 
 echo 🧱 开始编译 ...
-"%CSC_PATH%" /win32manifest:"%MANIFEST%" /win32icon:"%ICO%" /target:winexe /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.dll" /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.Windows.Forms.dll" /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.Serialization.dll" /out:"%OUT_EXE%" "%SRC%"
+"%CSC_PATH%" /win32manifest:"%MANIFEST%" /win32icon:"%ICO%" /target:winexe /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.dll" /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.Windows.Forms.dll" /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.Drawing.dll" /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.Management.dll" /reference:"%windir%\Microsoft.NET\Framework64\v4.0.30319\System.Runtime.Serialization.dll" /out:"%OUT_EXE%" "%SRC%"
 
 if %errorlevel% equ 0 (
     echo ✅ 编译成功
