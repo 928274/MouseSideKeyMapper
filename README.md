@@ -34,13 +34,12 @@
 环境：Windows 10/11 + .NET Framework 4.5+（系统自带 csc）。
 
 ```bat
-双击 构建\build.bat
+双击 build.bat
 ```
 
-- 源码：`构建\Form1.cs`
-- 图标：`构建\trayicon.ico`（编译进 exe 图标 + 托盘图标）
-- 输出：`构建\鼠标侧键映射.exe`
-- 把编译结果复制到运行目录 `C:\Users\92827\Software\鼠标侧键映射\`
+- 源码：`Form1.cs`
+- 图标：`trayicon.ico`（编译进 exe 图标 + 托盘图标）
+- 输出：`鼠标侧键映射.exe`
 
 ---
 
